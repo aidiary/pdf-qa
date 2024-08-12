@@ -1,39 +1,26 @@
 import os
-import time
-from uuid import uuid4
 
 import chainlit as cl
 from chainlit.types import AskFileResponse
+from langchain import hub
+from langchain.schema.runnable import RunnableConfig, RunnablePassthrough
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.document_loaders import PyPDFLoader, TextLoader
-from langchain_openai import OpenAIEmbeddings
+from langchain_core.output_parsers import StrOutputParser
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_pinecone import PineconeVectorStore
-from pinecone import Pinecone, ServerlessSpec
+from pinecone import Pinecone
 
 pc = Pinecone(api_key=os.environ["PINECONE_API_KEY"])
 
+# 事前にPineconeにログインしてインデックスを作成しておく
 index_name = "pdf-qa"
-
-# もしindexが存在しない場合は作成
-existing_indexes = [index_info["name"] for index_info in pc.list_indexes()]
-
-if index_name not in existing_indexes:
-    pc.create_index(
-        name=index_name,
-        dimension=1536,
-        metric="cosine",
-        spec=ServerlessSpec(cloud="aws", region="us-east-1"),
-    )
-    while not pc.describe_index(index_name).status["ready"]:
-        time.sleep(1)
-
 index = pc.Index(index_name)
 
 
 text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
 embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
 
-namespaces = set()
 
 welcome_message = """Chainlit PDF QA デモへようこそ！はじめるには
 1. PDFファイルまたはテキストファイルをアップロードしてください
@@ -64,19 +51,20 @@ def get_vector_store(file: AskFileResponse):
 
     namespace = file.name
 
-    if namespace in namespaces:
-        vector_store = PineconeVectorStore(
+    existing_namespaces = set(index.describe_index_stats()["namespaces"].keys())
+    print("***", existing_namespaces)
+
+    if namespace in existing_namespaces:
+        vectorstore = PineconeVectorStore(
             index_name=index_name, embedding=embeddings, namespace=namespace
         )
     else:
-        vector_store = PineconeVectorStore(
+        vectorstore = PineconeVectorStore(
             index_name=index_name, embedding=embeddings, namespace=namespace
         )
-        uuids = [str(uuid4()) for _ in range(len(docs))]
-        vector_store.add_documents(documents=docs, ids=uuids)
-        namespaces.add(namespace)
+        vectorstore.add_documents(docs)
 
-    return vector_store
+    return vectorstore
 
 
 @cl.on_chat_start
@@ -91,15 +79,42 @@ async def on_chat_start():
         ).send()
 
     file = files[0]
-    print(file)
 
     msg = cl.Message(content=f"`{file.name}` を処理中です...")
     await msg.send()
 
-    vector_store = await cl.make_async(get_vector_store)(file)
-    print(vector_store)
+    vectorstore = await cl.make_async(get_vector_store)(file)
+
+    retriever = vectorstore.as_retriever(search_kwargs={"k": 5, "namespace": file.name})
+    prompt = hub.pull("rlm/rag-prompt")
+    llm = ChatOpenAI(model="gpt-4o-mini")
+
+    def format_docs(docs):
+        return "\n\n".join(doc.page_content for doc in docs)
+
+    rag_chain = (
+        {"context": retriever | format_docs, "question": RunnablePassthrough()}
+        | prompt
+        | llm
+        | StrOutputParser()
+    )
+
+    msg.content = f"`{file.name}` の処理が完了しました！質問できます！"
+    await msg.update()
+
+    cl.user_session.set("chain", rag_chain)
 
 
 @cl.on_message
 async def on_message(message: cl.Message):
-    pass
+    chain = cl.user_session.get("chain")
+
+    msg = cl.Message(content="")
+
+    async for chunk in chain.astream(
+        message.content,
+        config=RunnableConfig(callbacks=[cl.LangchainCallbackHandler()]),
+    ):
+        await msg.stream_token(chunk)
+
+    await msg.send()
